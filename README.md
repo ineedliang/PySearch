@@ -35,25 +35,8 @@ Windows Explorer's built-in search struggles with wildcard patterns like `*parti
 
 ## 🖥️ Screenshots
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  ⌕  ADVANCED FILE SEARCH      Windows 10 · Wildcard · Filters  │
-├──────────────────────────────┬──────────────────────────────────┤
-│  Search Criteria             │  Filters & Options               │
-│  Search In:  C:\Projects\... │  Min Size: [ 0  ] [KB ] [ ]     │
-│  File Name:  *bot*.py        │  Max Size: [ 100] [MB ] [ ]     │
-│  Extensions: .py             │                                  │
-│  Path:       frbot            │  ☑ Search subdirectories        │
-│  Excl Files: __*             │  ☐ Case-sensitive                │
-│  Excl Dirs:  .venv,Lib       │  ☐ Include hidden               │
-├──────────────────────────────┴──────────────────────────────────┤
-│  [ ▶ Search ]  [ ■ Stop ]  [ ✕ Clear ]          12 results found│
-├──────────────────────────────────────────────────────────────────┤
-│  File Name          Ext   Path                   Size   Modified │
-│  bot_core.py        .py   F:\Sort Desktop\frbot  4.2KB  2024-... │
-│  bot_utils.py       .py   F:\Sort Desktop\frbot  1.8KB  2024-... │
-└──────────────────────────────────────────────────────────────────┘
-```
+<img width="1919" height="928" alt="image" src="https://github.com/user-attachments/assets/01585ea4-c827-438b-b77f-c55eb8fdeb3e" />
+
 
 ---
 
