@@ -902,22 +902,8 @@ class AdvancedSearchWindow(QMainWindow):
 
     def _run_python_file(self, full_path):
         dlg = RunPythonDialog(full_path, parent=self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            interp, args, pause = dlg.get_run_params()
-            script_dir = os.path.dirname(full_path)
-            # Build inner command with quoted paths
-            inner_parts = [f'"{interp}"', f'"{full_path}"']
-            inner_parts += [f'"{a}"' if ' ' in a else a for a in args]
-            inner = ' '.join(inner_parts)
-            # cmd.exe strips outer quotes when the arg to /k starts with "
-            # so we wrap the whole thing in an extra pair: cmd /k ""path" "script""
-            full_cmd = f'cmd {pause} "{inner}"'
-            subprocess.Popen(
-                full_cmd,
-                creationflags=subprocess.CREATE_NEW_CONSOLE,
-                cwd=script_dir
-            )
-            self.status_lbl.setText(f"Launched: {os.path.basename(full_path)}")
+        dlg.exec()
+        self.status_lbl.setText(f"Launched: {os.path.basename(full_path)}")
 
     def _context_menu(self, pos):
         row = self.table.rowAt(pos.y())
@@ -1012,6 +998,51 @@ def _find_python_interpreters(target_script_path=None):
     return found
 
 
+
+class _ConsoleRunner(QThread):
+    line_out     = pyqtSignal(str)
+    line_err     = pyqtSignal(str)
+    finished_sig = pyqtSignal(int)
+
+    def __init__(self, interp, script, args, cwd):
+        super().__init__()
+        self.interp = interp
+        self.script = script
+        self.args   = args
+        self.cwd    = cwd
+        self._proc  = None
+
+    def kill(self):
+        if self._proc:
+            self._proc.kill()
+
+    def run(self):
+        import threading as _threading
+        try:
+            self._proc = subprocess.Popen(
+                ([self.interp] + ([self.script] if self.script else []) + self.args),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=self.cwd,
+                text=True,
+                encoding="utf-8",
+                errors="replace"
+            )
+            def pump(pipe, sig):
+                for line in pipe:
+                    sig.emit(line.rstrip())
+                pipe.close()
+            t1 = _threading.Thread(target=pump, args=(self._proc.stdout, self.line_out), daemon=True)
+            t2 = _threading.Thread(target=pump, args=(self._proc.stderr, self.line_err), daemon=True)
+            t1.start(); t2.start()
+            t1.join();  t2.join()
+            self._proc.wait()
+            self.finished_sig.emit(self._proc.returncode)
+        except Exception as e:
+            self.line_err.emit(str(e))
+            self.finished_sig.emit(-1)
+
+
 class RunPythonDialog(QDialog):
     def __init__(self, filepath, parent=None):
         super().__init__(parent)
@@ -1081,11 +1112,6 @@ class RunPythonDialog(QDialog):
         self.args_input.setPlaceholderText('e.g.  --input file.csv  --verbose')
         layout.addWidget(self.args_input)
 
-        # Terminal mode
-        self.chk_pause = QCheckBox("Keep terminal open after script finishes  (cmd /k)")
-        self.chk_pause.setChecked(True)
-        layout.addWidget(self.chk_pause)
-
         # Preview command
         sep3 = QFrame(); sep3.setObjectName("separator"); sep3.setFixedHeight(1)
         layout.addWidget(sep3)
@@ -1102,48 +1128,355 @@ class RunPythonDialog(QDialog):
         # Wire up live preview
         self.interp_group.buttonClicked.connect(self._update_preview)
         self.args_input.textChanged.connect(self._update_preview)
-        self.chk_pause.stateChanged.connect(self._update_preview)
         self._update_preview()
 
+        # Progress bar (hidden until an operation is running)
+        self.op_progress = QProgressBar()
+        self.op_progress.setRange(0, 0)   # indeterminate
+        self.op_progress.setFixedHeight(6)
+        self.op_progress.setVisible(False)
+        layout.addWidget(self.op_progress)
+
+        # Built-in console output (hidden until used)
+        self.console_out = QTextEdit()
+        self.console_out.setReadOnly(True)
+        self.console_out.setMinimumHeight(160)
+        self.console_out.setMaximumHeight(260)
+        self.console_out.setStyleSheet(
+            "background:#060a0f; color:#a0aec0; font-family:Consolas; font-size:11px; border:1px solid #2d3748;")
+        self.console_out.setVisible(False)
+        layout.addWidget(self.console_out)
+
+        # ── Package Manager (hidden until venv exists) ──────────────
+        self.pkg_sep = QFrame(); self.pkg_sep.setObjectName("separator"); self.pkg_sep.setFixedHeight(1)
+        self.pkg_sep.setVisible(False)
+        layout.addWidget(self.pkg_sep)
+
+        self.pkg_lbl = QLabel("📦  Package Manager")
+        self.pkg_lbl.setStyleSheet("color:#63b3ed; font-weight:bold; font-size:11px; letter-spacing:0.5px;")
+        self.pkg_lbl.setVisible(False)
+        layout.addWidget(self.pkg_lbl)
+
+        # Installed packages list
+        self.pkg_list = QTableWidget(0, 2)
+        self.pkg_list.setHorizontalHeaderLabels(["Package", "Version"])
+        self.pkg_list.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.pkg_list.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.pkg_list.verticalHeader().setVisible(False)
+        self.pkg_list.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.pkg_list.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.pkg_list.setAlternatingRowColors(True)
+        self.pkg_list.setFixedHeight(140)
+        self.pkg_list.setVisible(False)
+        layout.addWidget(self.pkg_list)
+
+        # Install row
+        pkg_install_row = QHBoxLayout()
+        self.pkg_input = QLineEdit()
+        self.pkg_input.setPlaceholderText("package name  e.g. requests  numpy  discord.py")
+        self.pkg_input.setVisible(False)
+        self.pkg_install_btn = QPushButton("⬇  Install")
+        self.pkg_install_btn.setObjectName("searchBtn")
+        self.pkg_install_btn.setFixedWidth(90)
+        self.pkg_install_btn.setFixedHeight(30)
+        self.pkg_install_btn.setVisible(False)
+        self.pkg_req_btn = QPushButton("📄  Install requirements.txt")
+        self.pkg_req_btn.setFixedHeight(30)
+        self.pkg_req_btn.setVisible(False)
+        pkg_install_row.addWidget(self.pkg_input)
+        pkg_install_row.addWidget(self.pkg_install_btn)
+        pkg_install_row.addWidget(self.pkg_req_btn)
+        layout.addLayout(pkg_install_row)
+
+        self.pkg_input.returnPressed.connect(self._on_install_pkg)
+        self.pkg_install_btn.clicked.connect(self._on_install_pkg)
+        self.pkg_req_btn.clicked.connect(self._on_install_requirements)
+        # ────────────────────────────────────────────────────────────
+
         # Buttons
-        btn_box = QDialogButtonBox()
+        btn_row2 = QHBoxLayout()
         self.run_btn = QPushButton("▶  Run")
         self.run_btn.setObjectName("searchBtn")
         self.run_btn.setFixedHeight(34)
-        cancel_btn = QPushButton("Cancel")
+        self.kill_btn = QPushButton("■  Kill")
+        self.kill_btn.setObjectName("stopBtn")
+        self.kill_btn.setFixedHeight(34)
+        self.kill_btn.setVisible(False)
+        cancel_btn = QPushButton("Close")
         cancel_btn.setObjectName("clearBtn")
         cancel_btn.setFixedHeight(34)
-        btn_box.addButton(self.run_btn, QDialogButtonBox.ButtonRole.AcceptRole)
-        btn_box.addButton(cancel_btn, QDialogButtonBox.ButtonRole.RejectRole)
-        self.run_btn.clicked.connect(self.accept)
+        btn_row2.addWidget(self.run_btn)
+        btn_row2.addWidget(self.kill_btn)
+        btn_row2.addStretch()
+        btn_row2.addWidget(cancel_btn)
+        layout.addLayout(btn_row2)
+
+        self.run_btn.clicked.connect(self._on_run)
+        self.kill_btn.clicked.connect(self._on_kill)
         cancel_btn.clicked.connect(self.reject)
         if not self.interpreters:
             self.run_btn.setEnabled(False)
-        layout.addWidget(btn_box)
+
+        self._proc_thread   = None
+        self._recreate_btn  = None
+        self._venv_interp   = None   # set after successful recreate
+
+        # If venv already healthy, show pkg manager immediately
+        idx = max(self.interp_group.checkedId(), 0)
+        if self.interpreters:
+            self._maybe_show_pkg_manager(self.interpreters[idx][1])
 
     def _update_preview(self):
         cmd = self._build_command(preview=True)
         self.preview.setPlainText(cmd)
 
     def _build_command(self, preview=False):
-        idx = self.interp_group.checkedId()
+        idx = max(self.interp_group.checkedId(), 0)
         interp = self.interpreters[idx][1] if self.interpreters else "python"
         args = self.args_input.text().strip().split() if self.args_input.text().strip() else []
         script_dir = str(Path(self.filepath).parent)
-        pause = "/k" if self.chk_pause.isChecked() else "/c"
-        inner_parts = [f'"{interp}"', f'"{self.filepath}"']
-        inner_parts += [f'"{a}"' if ' ' in a else a for a in args]
-        inner = ' '.join(inner_parts)
+        inner = subprocess.list2cmdline([interp, self.filepath] + args)
         if preview:
-            return f'[cwd: {script_dir}]\ncmd {pause} "{inner}"'
+            return f'[cwd: {script_dir}]\n{inner}'
         return inner
 
-    def get_run_params(self):
-        idx = self.interp_group.checkedId()
+    # ── Launch ───────────────────────────────────────────────────────
+    def _on_run(self):
+        self._run_in_console()
+
+    def _on_kill(self):
+        if self._proc_thread:
+            self._proc_thread.kill()
+
+    def _run_in_console(self):
+        idx = max(self.interp_group.checkedId(), 0)
         interp = self.interpreters[idx][1] if self.interpreters else "python"
         args = self.args_input.text().strip().split() if self.args_input.text().strip() else []
-        pause = "/k" if self.chk_pause.isChecked() else "/c"
-        return interp, args, pause
+        script_dir = str(Path(self.filepath).parent)
+
+        self.console_out.setVisible(True)
+        self.console_out.clear()
+        self.run_btn.setEnabled(False)
+        self.kill_btn.setVisible(True)
+
+        self._log(f"▶ interpreter : {interp}")
+        self._log(f"▶ script      : {self.filepath}")
+        self._log(f"▶ cwd         : {script_dir}")
+        self._log("─" * 60)
+
+        if not Path(interp).exists():
+            self._log(f"\n⚠  Interpreter not found: {interp}", color="#fc8181")
+            self._log("   • Recreate the venv:  python -m venv .venv", color="#fbd38d")
+            self._log("   • Or select a different interpreter above", color="#fbd38d")
+            self.run_btn.setEnabled(True)
+            self.kill_btn.setVisible(False)
+            return
+
+        # pyvenv.cfg stale check
+        venv_dir = Path(interp).parent.parent
+        cfg = venv_dir / "pyvenv.cfg"
+        if cfg.exists():
+            cfg_text = cfg.read_text(encoding="utf-8", errors="ignore")
+            for line in cfg_text.splitlines():
+                if any(line.startswith(k) for k in ("home", "executable", "command")):
+                    self._log(f"   pyvenv.cfg: {line.strip()}", color="#4a5568")
+            for line in cfg_text.splitlines():
+                if line.startswith("executable"):
+                    stored = line.split("=", 1)[1].strip()
+                    if not Path(stored).exists():
+                        self._log("\n⚠  Stale venv detected!", color="#fc8181")
+                        self._log(f"   pyvenv.cfg points to: {stored}", color="#fc8181")
+                        self._log("   That path does not exist on this machine.", color="#fc8181")
+                        self._log("   The venv was built elsewhere and must be recreated here.", color="#fbd38d")
+                        self._log("─" * 60)
+                        self._show_recreate_btn(script_dir)
+                        self.run_btn.setEnabled(True)
+                        self.kill_btn.setVisible(False)
+                        return
+
+        self.op_progress.setVisible(True)
+        self._proc_thread = _ConsoleRunner(interp, self.filepath, args, script_dir)
+        self._proc_thread.line_out.connect(lambda t: self._log(t, color="#e2e8f0"))
+        self._proc_thread.line_err.connect(self._handle_err_line)
+        self._proc_thread.finished_sig.connect(self._on_proc_done)
+        self._proc_thread.start()
+
+    # ── Stale venv fix ───────────────────────────────────────────────
+    def _show_recreate_btn(self, script_dir):
+        if self._recreate_btn:
+            return
+        self._recreate_script_dir = script_dir
+        self._recreate_btn = QPushButton("🔧  Auto-fix: Recreate .venv here  (python -m venv .venv)")
+        self._recreate_btn.setStyleSheet(
+            "background:#276749; border:1px solid #48bb78; color:#c6f6d5;"
+            "font-weight:bold; padding:8px; border-radius:4px; font-size:12px;")
+        self._recreate_btn.clicked.connect(self._do_recreate_venv)
+        lay = self.layout()
+        lay.insertWidget(lay.indexOf(self.op_progress), self._recreate_btn)
+
+    def _do_recreate_venv(self):
+        import sys as _sys
+        self._recreate_btn.setEnabled(False)
+        self._recreate_btn.setText("⏳  Recreating .venv ...")
+        script_dir = self._recreate_script_dir
+        self.console_out.setVisible(True)
+        self.op_progress.setVisible(True)
+        self._log("\n▶ python -m venv .venv", color="#68d391")
+        self._log(f"  in: {script_dir}", color="#68d391")
+        self._log("─" * 60)
+        self._recreate_runner = _ConsoleRunner(
+            _sys.executable, "", ["-m", "venv", ".venv"], script_dir)
+        self._recreate_runner.line_out.connect(lambda t: self._log(t, color="#e2e8f0"))
+        self._recreate_runner.line_err.connect(lambda t: self._log(t, color="#fc8181"))
+        self._recreate_runner.finished_sig.connect(self._on_recreate_done)
+        self._recreate_runner.start()
+
+    def _on_recreate_done(self, retcode):
+        self.op_progress.setVisible(False)
+        script_dir = self._recreate_script_dir
+        venv_python = str(Path(script_dir) / ".venv" / "Scripts" / "python.exe")
+        if retcode == 0:
+            self._venv_interp = venv_python
+            self._log("\n✓ .venv recreated successfully!", color="#68d391")
+            self._recreate_btn.setText("✓  .venv recreated")
+            self._recreate_btn.setStyleSheet(
+                "background:#1a365d; border:1px solid #4299e1; color:#bee3f8;"
+                "font-weight:bold; padding:8px; border-radius:4px; font-size:12px;")
+            self._show_pkg_manager(venv_python, script_dir)
+        else:
+            self._log(f"\n✗ Recreate failed (exit {retcode})", color="#fc8181")
+            self._log("  Make sure 'python' is on your PATH", color="#fbd38d")
+            self._recreate_btn.setEnabled(True)
+            self._recreate_btn.setText("🔧  Retry: Recreate .venv")
+
+    # ── Package Manager ──────────────────────────────────────────────
+    def _maybe_show_pkg_manager(self, interp):
+        """Show package manager if the venv is valid (not stale)."""
+        if not Path(interp).exists():
+            return
+        venv_dir = Path(interp).parent.parent
+        cfg = venv_dir / "pyvenv.cfg"
+        if cfg.exists():
+            cfg_text = cfg.read_text(encoding="utf-8", errors="ignore")
+            for line in cfg_text.splitlines():
+                if line.startswith("executable"):
+                    stored = line.split("=", 1)[1].strip()
+                    if not Path(stored).exists():
+                        return  # stale — don't show manager
+        script_dir = str(Path(self.filepath).parent)
+        self._venv_interp = interp
+        self._show_pkg_manager(interp, script_dir)
+
+    def _show_pkg_manager(self, interp, script_dir):
+        self.pkg_sep.setVisible(True)
+        self.pkg_lbl.setVisible(True)
+        self.pkg_list.setVisible(True)
+        self.pkg_input.setVisible(True)
+        self.pkg_install_btn.setVisible(True)
+        req_file = Path(script_dir) / "requirements.txt"
+        self.pkg_req_btn.setVisible(req_file.exists())
+        self.adjustSize()
+        self._load_pkg_list(interp)
+
+    def _load_pkg_list(self, interp):
+        self.pkg_list.setRowCount(0)
+        try:
+            result = subprocess.run(
+                [interp, "-m", "pip", "list", "--format=columns"],
+                capture_output=True, text=True, timeout=15)
+            lines = result.stdout.strip().splitlines()
+            # Skip header lines (Package / Version / -------)
+            data_lines = [l for l in lines if l and not l.startswith("Package") and not l.startswith("---")]
+            self.pkg_list.setRowCount(len(data_lines))
+            for row, line in enumerate(data_lines):
+                parts = line.split()
+                pkg  = parts[0] if len(parts) > 0 else ""
+                ver  = parts[1] if len(parts) > 1 else ""
+                pi = QTableWidgetItem(pkg); pi.setForeground(QColor("#90cdf4"))
+                vi = QTableWidgetItem(ver); vi.setForeground(QColor("#68d391"))
+                vi.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.pkg_list.setItem(row, 0, pi)
+                self.pkg_list.setItem(row, 1, vi)
+            self.pkg_lbl.setText(f"📦  Package Manager  ({len(data_lines)} installed)")
+        except Exception as e:
+            self._log(f"pip list failed: {e}", color="#fc8181")
+
+    def _on_install_pkg(self):
+        pkg = self.pkg_input.text().strip()
+        if not pkg or not self._venv_interp:
+            return
+        script_dir = str(Path(self.filepath).parent)
+        self._run_pip(["install", pkg], script_dir, f"Installing {pkg}...")
+
+    def _on_install_requirements(self):
+        if not self._venv_interp:
+            return
+        script_dir = str(Path(self.filepath).parent)
+        req = str(Path(script_dir) / "requirements.txt")
+        self._run_pip(["install", "-r", req], script_dir, "Installing requirements.txt...")
+
+    def _run_pip(self, pip_args, script_dir, label):
+        self.console_out.setVisible(True)
+        self.op_progress.setVisible(True)
+        self.pkg_install_btn.setEnabled(False)
+        self.pkg_req_btn.setEnabled(False)
+        self._log(f"\n▶ pip {' '.join(pip_args)}", color="#63b3ed")
+        self._log("─" * 60)
+        runner = _ConsoleRunner(self._venv_interp, "", ["-m", "pip"] + pip_args, script_dir)
+        runner.line_out.connect(lambda t: self._log(t, color="#e2e8f0"))
+        runner.line_err.connect(lambda t: self._log(t, color="#fc8181"))
+        runner.finished_sig.connect(lambda rc: self._on_pip_done(rc))
+        self._pip_runner = runner
+        runner.start()
+
+    def _on_pip_done(self, retcode):
+        self.op_progress.setVisible(False)
+        self.pkg_install_btn.setEnabled(True)
+        self.pkg_req_btn.setEnabled(True)
+        self.pkg_input.clear()
+        if retcode == 0:
+            self._log("\n✓ Done!", color="#68d391")
+            self._load_pkg_list(self._venv_interp)   # refresh list
+        else:
+            self._log(f"\n✗ pip failed (exit {retcode})", color="#fc8181")
+
+    # ── Errors / logging ─────────────────────────────────────────────
+    def _handle_err_line(self, line):
+        self._log(line, color="#fc8181")
+        suggestions = {
+            "ModuleNotFoundError": "   → Fix: use Package Manager below to install the missing module",
+            "No module named":     "   → Fix: use Package Manager below to install the missing module",
+            "ImportError":         "   → Fix: check your venv has the right packages",
+            "SyntaxError":         "   → Fix: check the line number above for a syntax issue",
+            "PermissionError":     "   → Fix: run as administrator or check file permissions",
+            "FileNotFoundError":   "   → Fix: check the file/path exists",
+            "RecursionError":      "   → Fix: add sys.setrecursionlimit() or fix infinite recursion",
+            "MemoryError":         "   → Fix: reduce data size or increase available RAM",
+            "ConnectionRefused":   "   → Fix: check the server/port is running",
+        }
+        for key, tip in suggestions.items():
+            if key in line:
+                self._log(tip, color="#fbd38d")
+
+    def _on_proc_done(self, retcode):
+        self.op_progress.setVisible(False)
+        self._log("─" * 60)
+        if retcode == 0:
+            self._log(f"✓ Finished — exit code {retcode}", color="#68d391")
+        else:
+            self._log(f"✗ Exited with code {retcode}", color="#fc8181")
+        self.run_btn.setEnabled(True)
+        self.kill_btn.setVisible(False)
+
+    def _log(self, text, color="#a0aec0"):
+        self.console_out.setTextColor(QColor(color))
+        self.console_out.append(text)
+
+    def get_run_params(self):
+        idx = max(self.interp_group.checkedId(), 0)
+        interp = self.interpreters[idx][1] if self.interpreters else "python"
+        args = self.args_input.text().strip().split() if self.args_input.text().strip() else []
+        return interp, args
 
 
 # ─────────────────────────────────────────────
