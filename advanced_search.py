@@ -22,7 +22,8 @@ from PyQt6.QtWidgets import (
     QFileDialog, QComboBox, QSpinBox, QCheckBox, QHeaderView,
     QProgressBar, QSplitter, QGroupBox, QGridLayout, QFrame,
     QMenu, QMessageBox, QSizePolicy, QAbstractItemView,
-    QDialog, QDialogButtonBox, QRadioButton, QButtonGroup, QTextEdit
+    QDialog, QDialogButtonBox, QRadioButton, QButtonGroup, QTextEdit,
+    QListWidget, QListWidgetItem
 )
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QTimer, QSize
@@ -692,9 +693,18 @@ class AdvancedSearchWindow(QMainWindow):
         self.result_count_lbl = QLabel("No results yet")
         self.result_count_lbl.setObjectName("resultCount")
 
+        self.new_proj_btn = QPushButton("＋  New Project")
+        self.new_proj_btn.setFixedHeight(36)
+        self.new_proj_btn.setStyleSheet(
+            "QPushButton{background:#276749;border:1px solid #48bb78;color:#c6f6d5;"
+            "font-weight:bold;border-radius:4px;padding:7px 16px;font-size:12px;}"
+            "QPushButton:hover{background:#2f855a;}")
+        self.new_proj_btn.clicked.connect(self._open_new_project)
+
         btn_row.addWidget(self.search_btn)
         btn_row.addWidget(self.stop_btn)
         btn_row.addWidget(self.clear_btn)
+        btn_row.addWidget(self.new_proj_btn)
         btn_row.addStretch()
         btn_row.addWidget(self.result_count_lbl)
         root_layout.addLayout(btn_row)
@@ -904,6 +914,10 @@ class AdvancedSearchWindow(QMainWindow):
         dlg = RunPythonDialog(full_path, parent=self)
         dlg.exec()
         self.status_lbl.setText(f"Launched: {os.path.basename(full_path)}")
+
+    def _open_new_project(self):
+        dlg = NewProjectDialog(parent=self)
+        dlg.exec()
 
     def _context_menu(self, pos):
         row = self.table.rowAt(pos.y())
@@ -1444,19 +1458,49 @@ class RunPythonDialog(QDialog):
     def _handle_err_line(self, line):
         self._log(line, color="#fc8181")
         suggestions = {
-            "ModuleNotFoundError": "   → Fix: use Package Manager below to install the missing module",
-            "No module named":     "   → Fix: use Package Manager below to install the missing module",
-            "ImportError":         "   → Fix: check your venv has the right packages",
-            "SyntaxError":         "   → Fix: check the line number above for a syntax issue",
-            "PermissionError":     "   → Fix: run as administrator or check file permissions",
-            "FileNotFoundError":   "   → Fix: check the file/path exists",
-            "RecursionError":      "   → Fix: add sys.setrecursionlimit() or fix infinite recursion",
-            "MemoryError":         "   → Fix: reduce data size or increase available RAM",
-            "ConnectionRefused":   "   → Fix: check the server/port is running",
+            "SyntaxError":       "   → Fix: check the line number above for a syntax issue",
+            "PermissionError":   "   → Fix: run as administrator or check file permissions",
+            "FileNotFoundError": "   → Fix: check the file/path exists",
+            "RecursionError":    "   → Fix: add sys.setrecursionlimit() or fix infinite recursion",
+            "MemoryError":       "   → Fix: reduce data size or increase available RAM",
+            "ConnectionRefused": "   → Fix: check the server/port is running",
         }
         for key, tip in suggestions.items():
             if key in line:
                 self._log(tip, color="#fbd38d")
+
+        # Auto-detect missing module and offer one-click install
+        import re as _re
+        m = _re.search(r"No module named .([\w.]+).", line)
+        if not m:
+            m = _re.search(r"ModuleNotFoundError.*([\w.]+)", line)
+        if m:
+            mod = m.group(1).split(".")[0]
+            pkg = MODULE_TO_PACKAGE.get(mod, mod)
+            self._log(f"   → Missing module: {mod}", color="#fbd38d")
+            self._log(f"   → Likely package:  {pkg}", color="#fbd38d")
+            if self._venv_interp:
+                self._offer_install_btn(pkg)
+
+    def _offer_install_btn(self, pkg):
+        """Show a one-click install button for a missing package."""
+        btn_id = f"_install_btn_{pkg}"
+        if hasattr(self, btn_id):
+            return  # already showing
+        btn = QPushButton(f"⬇  Install  {pkg}  into venv")
+        btn.setStyleSheet(
+            "background:#2b4a7a; border:1px solid #4299e1; color:#bee3f8;"
+            "font-weight:bold; padding:6px 12px; border-radius:4px; font-size:11px;")
+        btn.clicked.connect(lambda: self._quick_install(pkg, btn))
+        setattr(self, btn_id, btn)
+        lay = self.layout()
+        lay.insertWidget(lay.indexOf(self.console_out) + 1, btn)
+
+    def _quick_install(self, pkg, btn):
+        btn.setEnabled(False)
+        btn.setText(f"⏳  Installing {pkg}...")
+        script_dir = str(Path(self.filepath).parent)
+        self._run_pip(["install", pkg], script_dir, f"install {pkg}")
 
     def _on_proc_done(self, retcode):
         self.op_progress.setVisible(False)
@@ -1477,6 +1521,565 @@ class RunPythonDialog(QDialog):
         interp = self.interpreters[idx][1] if self.interpreters else "python"
         args = self.args_input.text().strip().split() if self.args_input.text().strip() else []
         return interp, args
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  PACKAGE DATA
+#  module_name → pip_package  (for auto-fix on ImportError)
+# ─────────────────────────────────────────────────────────────────────────────
+MODULE_TO_PACKAGE = {
+    # Web / HTTP
+    "requests": "requests", "httpx": "httpx", "aiohttp": "aiohttp",
+    "urllib3": "urllib3", "httplib2": "httplib2", "websocket": "websocket-client",
+    "websockets": "websockets", "flask": "flask", "fastapi": "fastapi",
+    "uvicorn": "uvicorn", "starlette": "starlette", "django": "django",
+    "tornado": "tornado", "bottle": "bottle", "sanic": "sanic",
+    "quart": "quart", "litestar": "litestar",
+    # Data / Science
+    "numpy": "numpy", "np": "numpy", "pandas": "pandas", "pd": "pandas",
+    "scipy": "scipy", "sklearn": "scikit-learn", "matplotlib": "matplotlib",
+    "plt": "matplotlib", "seaborn": "seaborn", "plotly": "plotly",
+    "bokeh": "bokeh", "altair": "altair", "statsmodels": "statsmodels",
+    "xgboost": "xgboost", "lightgbm": "lightgbm", "catboost": "catboost",
+    # AI / ML
+    "torch": "torch", "torchvision": "torchvision", "tensorflow": "tensorflow",
+    "tf": "tensorflow", "keras": "keras", "transformers": "transformers",
+    "openai": "openai", "anthropic": "anthropic", "langchain": "langchain",
+    "langchain_core": "langchain-core", "langchain_community": "langchain-community",
+    "llama_index": "llama-index", "chromadb": "chromadb", "tiktoken": "tiktoken",
+    "sentence_transformers": "sentence-transformers", "diffusers": "diffusers",
+    # Database
+    "sqlalchemy": "SQLAlchemy", "alembic": "alembic", "pymysql": "PyMySQL",
+    "psycopg2": "psycopg2-binary", "motor": "motor", "pymongo": "pymongo",
+    "redis": "redis", "aioredis": "aioredis", "databases": "databases",
+    "tortoise": "tortoise-orm", "peewee": "peewee", "dataset": "dataset",
+    "tinydb": "tinydb",
+    # Async
+    "asyncio": "asyncio", "trio": "trio", "anyio": "anyio",
+    "celery": "celery", "dramatiq": "dramatiq", "rq": "rq",
+    # CLI / TUI
+    "click": "click", "typer": "typer", "rich": "rich",
+    "textual": "textual", "urwid": "urwid", "blessed": "blessed",
+    "colorama": "colorama", "tqdm": "tqdm", "alive_progress": "alive-progress",
+    "argparse": "argparse", "docopt": "docopt", "fire": "fire",
+    # File / IO
+    "openpyxl": "openpyxl", "xlrd": "xlrd", "xlwt": "xlwt",
+    "xlsxwriter": "XlsxWriter", "pypdf": "pypdf", "pypdf2": "PyPDF2",
+    "pdfplumber": "pdfplumber", "reportlab": "reportlab", "fpdf": "fpdf2",
+    "docx": "python-docx", "docx2txt": "docx2txt", "pptx": "python-pptx",
+    "csv": "csv", "toml": "toml", "tomllib": "tomli",
+    "yaml": "pyyaml", "dotenv": "python-dotenv", "decouple": "python-decouple",
+    # Image / Media
+    "PIL": "Pillow", "cv2": "opencv-python", "imageio": "imageio",
+    "skimage": "scikit-image", "wand": "Wand",
+    "pydub": "pydub", "librosa": "librosa", "soundfile": "soundfile",
+    "moviepy": "moviepy", "av": "av",
+    # GUI
+    "tkinter": "tk", "wx": "wxPython", "gi": "PyGObject",
+    "PyQt5": "PyQt5", "PyQt6": "PyQt6", "PySide6": "PySide6",
+    "kivy": "kivy", "customtkinter": "customtkinter",
+    # Scraping
+    "bs4": "beautifulsoup4", "BeautifulSoup": "beautifulsoup4",
+    "scrapy": "scrapy", "selenium": "selenium", "playwright": "playwright",
+    "mechanize": "mechanize", "lxml": "lxml", "parsel": "parsel",
+    # Config / Validation
+    "pydantic": "pydantic", "attrs": "attrs", "marshmallow": "marshmallow",
+    "cerberus": "cerberus", "voluptuous": "voluptuous",
+    # Networking / protocols
+    "paramiko": "paramiko", "fabric": "fabric", "netmiko": "netmiko",
+    "ftplib": "ftplib", "imaplib": "imaplib", "smtplib": "smtplib",
+    "socket": "socket", "pyzmq": "pyzmq", "zmq": "pyzmq",
+    "pika": "pika", "kafka": "kafka-python", "nats": "nats-py",
+    # Security / Crypto
+    "cryptography": "cryptography", "nacl": "PyNaCl", "jwt": "PyJWT",
+    "bcrypt": "bcrypt", "passlib": "passlib", "pyotp": "pyotp",
+    # Testing
+    "pytest": "pytest", "hypothesis": "hypothesis", "faker": "Faker",
+    "factory_boy": "factory-boy", "responses": "responses",
+    "freezegun": "freezegun", "mock": "mock",
+    # DevOps / Cloud
+    "boto3": "boto3", "botocore": "botocore", "azure": "azure",
+    "google.cloud": "google-cloud", "kubernetes": "kubernetes",
+    "docker": "docker", "ansible": "ansible",
+    # Bots / Messaging
+    "discord": "discord.py", "telegram": "python-telegram-bot",
+    "slack_sdk": "slack-sdk", "tweepy": "tweepy",
+    "telethon": "Telethon", "pyrogram": "pyrogram",
+    # Misc
+    "arrow": "arrow", "pendulum": "pendulum", "dateutil": "python-dateutil",
+    "humanize": "humanize", "tabulate": "tabulate", "prettytable": "PrettyTable",
+    "loguru": "loguru", "structlog": "structlog",
+    "apscheduler": "APScheduler", "schedule": "schedule",
+    "psutil": "psutil", "pywin32": "pywin32", "winreg": "pywin32",
+    "pyautogui": "pyautogui", "pynput": "pynput", "keyboard": "keyboard",
+    "pyperclip": "pyperclip", "plyer": "plyer", "notify2": "notify2",
+    "qrcode": "qrcode", "barcode": "python-barcode",
+    "pint": "pint", "sympy": "sympy", "networkx": "networkx",
+}
+
+# Categorised package list for the picker UI
+PACKAGE_CATALOG = {
+    "🌐  Web & HTTP": [
+        "requests", "httpx", "aiohttp", "flask", "fastapi", "uvicorn",
+        "django", "tornado", "starlette", "bottle", "sanic", "quart",
+        "websockets", "websocket-client", "httplib2", "litestar",
+    ],
+    "📊  Data & Science": [
+        "numpy", "pandas", "scipy", "scikit-learn", "matplotlib",
+        "seaborn", "plotly", "bokeh", "altair", "statsmodels",
+        "xgboost", "lightgbm", "catboost", "pyarrow", "polars",
+    ],
+    "🤖  AI & ML": [
+        "openai", "anthropic", "torch", "torchvision", "tensorflow",
+        "keras", "transformers", "langchain", "langchain-core",
+        "langchain-community", "llama-index", "chromadb", "tiktoken",
+        "sentence-transformers", "diffusers", "huggingface-hub",
+    ],
+    "🗄️  Database": [
+        "SQLAlchemy", "alembic", "pymongo", "motor", "redis", "aioredis",
+        "PyMySQL", "psycopg2-binary", "databases", "tortoise-orm",
+        "peewee", "dataset", "tinydb", "elasticsearch",
+    ],
+    "⚡  Async & Tasks": [
+        "anyio", "trio", "celery", "dramatiq", "rq", "apscheduler",
+        "schedule", "asyncpg", "aiofiles", "aiobotocore",
+    ],
+    "🖥️  CLI & TUI": [
+        "click", "typer", "rich", "textual", "colorama", "tqdm",
+        "alive-progress", "fire", "docopt", "blessed", "urwid",
+        "questionary", "prompt-toolkit",
+    ],
+    "📁  Files & Formats": [
+        "openpyxl", "xlrd", "XlsxWriter", "pypdf", "PyPDF2", "pdfplumber",
+        "reportlab", "fpdf2", "python-docx", "python-pptx",
+        "pyyaml", "toml", "tomli", "python-dotenv", "python-decouple",
+        "lxml", "xmltodict", "python-magic",
+    ],
+    "🖼️  Image & Media": [
+        "Pillow", "opencv-python", "imageio", "scikit-image",
+        "Wand", "pydub", "librosa", "soundfile", "moviepy",
+    ],
+    "🕷️  Scraping": [
+        "beautifulsoup4", "scrapy", "selenium", "playwright",
+        "lxml", "parsel", "mechanize", "httpx", "pyppeteer",
+    ],
+    "✅  Validation & Config": [
+        "pydantic", "attrs", "marshmallow", "cerberus",
+        "voluptuous", "dynaconf", "confuse",
+    ],
+    "🔐  Security & Auth": [
+        "cryptography", "PyJWT", "bcrypt", "passlib", "pyotp",
+        "PyNaCl", "paramiko", "python-jose",
+    ],
+    "🤖  Bots & Messaging": [
+        "discord.py", "python-telegram-bot", "slack-sdk",
+        "tweepy", "Telethon", "pyrogram", "nextcord",
+    ],
+    "☁️  Cloud & DevOps": [
+        "boto3", "google-cloud-storage", "azure-storage-blob",
+        "kubernetes", "docker", "ansible", "fabric",
+    ],
+    "🧪  Testing": [
+        "pytest", "hypothesis", "Faker", "factory-boy", "responses",
+        "freezegun", "mock", "pytest-asyncio", "pytest-cov", "coverage",
+    ],
+    "🔧  Utilities": [
+        "loguru", "structlog", "python-dateutil", "arrow", "pendulum",
+        "humanize", "tabulate", "PrettyTable", "psutil",
+        "pywin32", "pyautogui", "pynput", "keyboard", "pyperclip",
+        "qrcode", "sympy", "networkx", "pint",
+    ],
+    "🔥  PyTorch + CUDA": [
+        "torch  (CPU)",
+        "torch  (CUDA 11.8)",
+        "torch  (CUDA 12.1)",
+        "torch  (CUDA 12.4)",
+        "torch  (CUDA 12.6)  ← cu126",
+        "torch  (CUDA 12.8)",
+        "torchvision  (CPU)",
+        "torchvision  (CUDA 11.8)",
+        "torchvision  (CUDA 12.1)",
+        "torchvision  (CUDA 12.4)",
+        "torchvision  (CUDA 12.6)  ← cu126",
+        "torchvision  (CUDA 12.8)",
+        "torchaudio  (CPU)",
+        "torchaudio  (CUDA 11.8)",
+        "torchaudio  (CUDA 12.1)",
+        "torchaudio  (CUDA 12.4)",
+        "torchaudio  (CUDA 12.6)  ← cu126",
+        "torchaudio  (CUDA 12.8)",
+    ],
+}
+
+# Maps display label → (packages, extra_pip_args)
+# Torch CUDA installs need --index-url so they can't go through normal pip install
+TORCH_INSTALL_MAP = {
+    "torch  (CPU)":                      (["torch", "torchvision", "torchaudio"], []),
+    "torch  (CUDA 11.8)":               (["torch", "torchvision", "torchaudio"], ["--index-url", "https://download.pytorch.org/whl/cu118"]),
+    "torch  (CUDA 12.1)":               (["torch", "torchvision", "torchaudio"], ["--index-url", "https://download.pytorch.org/whl/cu121"]),
+    "torch  (CUDA 12.4)":               (["torch", "torchvision", "torchaudio"], ["--index-url", "https://download.pytorch.org/whl/cu124"]),
+    "torch  (CUDA 12.6)  ← cu126":      (["torch", "torchvision", "torchaudio"], ["--index-url", "https://download.pytorch.org/whl/cu126"]),
+    "torch  (CUDA 12.8)":               (["torch", "torchvision", "torchaudio"], ["--index-url", "https://download.pytorch.org/whl/cu128"]),
+    "torchvision  (CPU)":               (["torchvision"], []),
+    "torchvision  (CUDA 11.8)":         (["torchvision"], ["--index-url", "https://download.pytorch.org/whl/cu118"]),
+    "torchvision  (CUDA 12.1)":         (["torchvision"], ["--index-url", "https://download.pytorch.org/whl/cu121"]),
+    "torchvision  (CUDA 12.4)":         (["torchvision"], ["--index-url", "https://download.pytorch.org/whl/cu124"]),
+    "torchvision  (CUDA 12.6)  ← cu126":(["torchvision"], ["--index-url", "https://download.pytorch.org/whl/cu126"]),
+    "torchvision  (CUDA 12.8)":         (["torchvision"], ["--index-url", "https://download.pytorch.org/whl/cu128"]),
+    "torchaudio  (CPU)":                (["torchaudio"], []),
+    "torchaudio  (CUDA 11.8)":          (["torchaudio"], ["--index-url", "https://download.pytorch.org/whl/cu118"]),
+    "torchaudio  (CUDA 12.1)":          (["torchaudio"], ["--index-url", "https://download.pytorch.org/whl/cu121"]),
+    "torchaudio  (CUDA 12.4)":          (["torchaudio"], ["--index-url", "https://download.pytorch.org/whl/cu124"]),
+    "torchaudio  (CUDA 12.6)  ← cu126": (["torchaudio"], ["--index-url", "https://download.pytorch.org/whl/cu126"]),
+    "torchaudio  (CUDA 12.8)":          (["torchaudio"], ["--index-url", "https://download.pytorch.org/whl/cu128"]),
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  NEW PROJECT DIALOG
+# ─────────────────────────────────────────────────────────────────────────────
+class NewProjectDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("New Python Project")
+        self.setMinimumSize(760, 680)
+        self.resize(820, 740)
+        self.setStyleSheet(DARK_STYLE + """
+            QDialog { border: 1px solid #2d3748; }
+            QTabWidget::pane { border: 1px solid #2d3748; background: #0e1117; }
+            QTabBar::tab { background:#141921; color:#718096; padding:6px 16px;
+                border:1px solid #2d3748; border-bottom:none; border-radius:3px 3px 0 0; }
+            QTabBar::tab:selected { background:#0e1117; color:#63b3ed; border-bottom:1px solid #0e1117; }
+            QListWidget { background:#0e1117; border:1px solid #2d3748;
+                color:#e2e8f0; font-size:12px; }
+            QListWidget::item { padding:4px 8px; }
+            QListWidget::item:selected { background:#1e3a5f; color:#bee3f8; }
+            QListWidget::item:hover { background:#1a2535; }
+            QCheckBox { color:#e2e8f0; spacing:6px; }
+        """)
+        self._selected_pkgs  = set()   # normal packages
+        self._torch_selections = set() # torch variant display labels
+        self._proc_thread    = None
+        self._project_dir    = None
+        self._build()
+
+    def _build(self):
+        lay = QVBoxLayout(self)
+        lay.setSpacing(10)
+        lay.setContentsMargins(16, 14, 16, 12)
+
+        # Title
+        title = QLabel("＋  New Python Project")
+        title.setFont(QFont("Consolas", 13, QFont.Weight.Bold))
+        title.setStyleSheet("color:#48bb78; letter-spacing:1px;")
+        lay.addWidget(title)
+
+        sep = QFrame(); sep.setObjectName("separator"); sep.setFixedHeight(1)
+        lay.addWidget(sep)
+
+        # ── Row 1: project folder ──
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("Project Folder:"))
+        self.dir_edit = QLineEdit()
+        self.dir_edit.setPlaceholderText("e.g.  C:\\Projects\\my_bot")
+        browse = QPushButton("Browse…"); browse.setFixedWidth(80)
+        browse.clicked.connect(self._browse)
+        row1.addWidget(self.dir_edit)
+        row1.addWidget(browse)
+        lay.addLayout(row1)
+
+        # ── Row 2: project name ──
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("Project Name:"))
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("my_project  (used as subfolder name)")
+        row2.addWidget(self.name_edit)
+        lay.addLayout(row2)
+
+        # ── Row 3: python interpreter ──
+        row3 = QHBoxLayout()
+        row3.addWidget(QLabel("Python:"))
+        self.interp_combo = QComboBox()
+        self._populate_interpreters()
+        row3.addWidget(self.interp_combo)
+        lay.addLayout(row3)
+
+        sep2 = QFrame(); sep2.setObjectName("separator"); sep2.setFixedHeight(1)
+        lay.addWidget(sep2)
+
+        # ── Package Picker ──
+        pkg_hdr = QHBoxLayout()
+        pkg_lbl = QLabel("Select Packages:")
+        pkg_lbl.setStyleSheet("color:#63b3ed; font-weight:bold; font-size:11px;")
+        self.pkg_count_lbl = QLabel("0 selected")
+        self.pkg_count_lbl.setStyleSheet("color:#68d391; font-size:11px;")
+        self.pkg_search = QLineEdit()
+        self.pkg_search.setPlaceholderText("🔍  search packages…")
+        self.pkg_search.setFixedWidth(200)
+        self.pkg_search.textChanged.connect(self._filter_packages)
+        pkg_hdr.addWidget(pkg_lbl)
+        pkg_hdr.addWidget(self.pkg_count_lbl)
+        pkg_hdr.addStretch()
+        pkg_hdr.addWidget(self.pkg_search)
+        lay.addLayout(pkg_hdr)
+
+        # Category tabs + package list side by side
+        pkg_body = QHBoxLayout(); pkg_body.setSpacing(8)
+
+        self.cat_list = QListWidget()
+        self.cat_list.setFixedWidth(180)
+        self.cat_list.setFixedHeight(260)
+        for cat in PACKAGE_CATALOG:
+            self.cat_list.addItem(cat)
+        self.cat_list.currentTextChanged.connect(self._load_category)
+        pkg_body.addWidget(self.cat_list)
+
+        self.pkg_check_list = QListWidget()
+        self.pkg_check_list.setFixedHeight(260)
+        self.pkg_check_list.itemChanged.connect(self._on_pkg_toggled)
+        pkg_body.addWidget(self.pkg_check_list)
+
+        lay.addLayout(pkg_body)
+
+        # Selected chips display
+        self.selected_lbl = QLabel("No packages selected.")
+        self.selected_lbl.setStyleSheet("color:#4a5568; font-size:10px; font-family:Consolas;")
+        self.selected_lbl.setWordWrap(True)
+        lay.addWidget(self.selected_lbl)
+
+        sep3 = QFrame(); sep3.setObjectName("separator"); sep3.setFixedHeight(1)
+        lay.addWidget(sep3)
+
+        # Progress bar
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)
+        self.progress.setFixedHeight(6)
+        self.progress.setVisible(False)
+        lay.addWidget(self.progress)
+
+        # Console output
+        self.console = QTextEdit()
+        self.console.setReadOnly(True)
+        self.console.setFixedHeight(120)
+        self.console.setStyleSheet(
+            "background:#060a0f; color:#a0aec0; font-family:Consolas;"
+            "font-size:11px; border:1px solid #2d3748;")
+        self.console.setVisible(False)
+        lay.addWidget(self.console)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        self.create_btn = QPushButton("🚀  Create Project")
+        self.create_btn.setObjectName("searchBtn")
+        self.create_btn.setFixedHeight(36)
+        self.create_btn.clicked.connect(self._create_project)
+        close_btn = QPushButton("Close")
+        close_btn.setObjectName("clearBtn")
+        close_btn.setFixedHeight(36)
+        close_btn.clicked.connect(self.reject)
+        btn_row.addWidget(self.create_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(close_btn)
+        lay.addLayout(btn_row)
+
+        # Load first category
+        self.cat_list.setCurrentRow(0)
+
+    def _populate_interpreters(self):
+        interps = _find_python_interpreters()
+        self._interp_paths = []
+        for label, path in interps:
+            self.interp_combo.addItem(label)
+            self._interp_paths.append(path)
+        if not interps:
+            self.interp_combo.addItem("No Python found on PATH")
+            self._interp_paths.append("")
+
+    def _browse(self):
+        d = QFileDialog.getExistingDirectory(self, "Select Parent Folder")
+        if d:
+            self.dir_edit.setText(d)
+
+    def _load_category(self, cat_text):
+        self.pkg_check_list.blockSignals(True)
+        self.pkg_check_list.clear()
+        pkgs = PACKAGE_CATALOG.get(cat_text, [])
+        search = self.pkg_search.text().lower()
+        is_torch_cat = "PyTorch" in cat_text
+        for pkg in pkgs:
+            if search and search not in pkg.lower():
+                continue
+            item = QListWidgetItem(pkg)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            if is_torch_cat:
+                # Torch variants live in _torch_selections, not _selected_pkgs
+                checked = pkg in self._torch_selections
+                item.setForeground(QColor("#f6ad55"))
+                if "← cu126" in pkg:
+                    item.setForeground(QColor("#fc8181"))  # highlight recommended
+            else:
+                checked = pkg in self._selected_pkgs
+            item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+            self.pkg_check_list.addItem(item)
+        self.pkg_check_list.blockSignals(False)
+
+    def _filter_packages(self):
+        cat = self.cat_list.currentItem()
+        if cat:
+            self._load_category(cat.text())
+
+    def _on_pkg_toggled(self, item):
+        pkg = item.text()
+        is_torch = pkg in TORCH_INSTALL_MAP
+        if item.checkState() == Qt.CheckState.Checked:
+            if is_torch:
+                self._torch_selections.add(pkg)
+            else:
+                self._selected_pkgs.add(pkg)
+        else:
+            if is_torch:
+                self._torch_selections.discard(pkg)
+            else:
+                self._selected_pkgs.discard(pkg)
+        total = len(self._selected_pkgs) + len(self._torch_selections)
+        self.pkg_count_lbl.setText(f"{total} selected")
+        parts = sorted(self._selected_pkgs) + sorted(self._torch_selections)
+        if parts:
+            self.selected_lbl.setText("  ".join(parts))
+            self.selected_lbl.setStyleSheet("color:#90cdf4; font-size:10px; font-family:Consolas;")
+        else:
+            self.selected_lbl.setText("No packages selected.")
+            self.selected_lbl.setStyleSheet("color:#4a5568; font-size:10px; font-family:Consolas;")
+
+    def _log(self, text, color="#a0aec0"):
+        self.console.setTextColor(QColor(color))
+        self.console.append(text)
+
+    def _create_project(self):
+        parent_dir = self.dir_edit.text().strip()
+        name       = self.name_edit.text().strip()
+        if not parent_dir or not name:
+            QMessageBox.warning(self, "Missing Info", "Please set both a folder and a project name.")
+            return
+        idx = self.interp_combo.currentIndex()
+        interp = self._interp_paths[idx] if idx >= 0 and self._interp_paths else ""
+        if not interp or not Path(interp).exists():
+            QMessageBox.warning(self, "No Interpreter", "Please select a valid Python interpreter.")
+            return
+
+        project_dir = str(Path(parent_dir) / name)
+        self._project_dir = project_dir
+
+        self.create_btn.setEnabled(False)
+        self.console.setVisible(True)
+        self.progress.setVisible(True)
+        self.console.clear()
+        self._log(f"▶ Creating project: {project_dir}", color="#48bb78")
+        self._log("─" * 60)
+
+        # Create folder
+        try:
+            Path(project_dir).mkdir(parents=True, exist_ok=True)
+            self._log(f"✓ Folder created: {project_dir}", color="#68d391")
+        except Exception as e:
+            self._log(f"✗ Could not create folder: {e}", color="#fc8181")
+            self.create_btn.setEnabled(True)
+            self.progress.setVisible(False)
+            return
+
+        # Write blank main.py
+        main_py = Path(project_dir) / "main.py"
+        if not main_py.exists():
+            main_py.write_text(
+                '# main.py\n\ndef main():\n    pass\n\n\nif __name__ == "__main__":\n    main()\n',
+                encoding="utf-8")
+            self._log("✓ main.py created", color="#68d391")
+
+        self._log("▶ Creating .venv ...", color="#63b3ed")
+        self._setup_runner = _ConsoleRunner(interp, "", ["-m", "venv", ".venv"], project_dir)
+        self._setup_runner.line_out.connect(lambda t: self._log(t))
+        self._setup_runner.line_err.connect(lambda t: self._log(t, color="#fc8181"))
+        self._setup_runner.finished_sig.connect(self._on_venv_done)
+        self._setup_runner.start()
+
+    def _on_venv_done(self, retcode):
+        project_dir = self._project_dir
+        if retcode != 0:
+            self._log("✗ venv creation failed", color="#fc8181")
+            self.create_btn.setEnabled(True)
+            self.progress.setVisible(False)
+            return
+        self._log("✓ .venv created", color="#68d391")
+        venv_python = str(Path(project_dir) / ".venv" / "Scripts" / "python.exe")
+
+        # Build install queue: torch variants first (each needs its own --index-url),
+        # then all normal packages in one shot.
+        self._install_queue = []
+        for label in sorted(self._torch_selections):
+            pkgs_list, extra = TORCH_INSTALL_MAP[label]
+            self._install_queue.append((pkgs_list, extra, label))
+        normal = sorted(self._selected_pkgs)
+        if normal:
+            self._install_queue.append((normal, [], "standard packages"))
+
+        self._venv_python_path = venv_python
+        self._run_next_install()
+
+    def _run_next_install(self):
+        project_dir = self._project_dir
+        venv_python = self._venv_python_path
+        if not self._install_queue:
+            self._finish_project(venv_python, project_dir, [])
+            return
+        pkgs_list, extra, label = self._install_queue.pop(0)
+        self._log(f"▶ Installing: {label}", color="#63b3ed")
+        if extra:
+            self._log(f"   {' '.join(extra)}", color="#4a5568")
+        self._install_runner = _ConsoleRunner(
+            venv_python, "", ["-m", "pip", "install"] + pkgs_list + extra, project_dir)
+        self._install_runner.line_out.connect(lambda t: self._log(t))
+        self._install_runner.line_err.connect(lambda t: self._log(t, color="#fc8181"))
+        self._install_runner.finished_sig.connect(self._on_install_step_done)
+        self._install_runner.start()
+
+    def _on_install_step_done(self, retcode):
+        if retcode == 0:
+            self._log("✓ Done", color="#68d391")
+        else:
+            self._log("⚠  Install step had errors — check output above", color="#fbd38d")
+        self._run_next_install()
+
+    # _on_install_done kept for compatibility but queue handles steps now
+
+    def _finish_project(self, venv_python, project_dir, pkgs):
+        # Write requirements.txt from actual pip freeze
+        try:
+            result = subprocess.run(
+                [venv_python, "-m", "pip", "freeze"],
+                capture_output=True, text=True, timeout=15, cwd=project_dir)
+            req_text = result.stdout.strip()
+            req_path = Path(project_dir) / "requirements.txt"
+            req_path.write_text(req_text, encoding="utf-8")
+            lines = [l for l in req_text.splitlines() if l]
+            self._log(f"✓ requirements.txt written ({len(lines)} entries)", color="#68d391")
+        except Exception as e:
+            self._log(f"⚠  Could not write requirements.txt: {e}", color="#fbd38d")
+
+        self.progress.setVisible(False)
+        self._log("─" * 60)
+        self._log("🚀  Project ready!", color="#48bb78")
+        self._log(f"   {project_dir}", color="#90cdf4")
+        self._log("   Files: main.py  .venv/  requirements.txt", color="#a0aec0")
+
+        # Open in explorer
+        open_btn = QPushButton("📁  Open Project Folder")
+        open_btn.setFixedHeight(30)
+        open_btn.clicked.connect(lambda: os.startfile(project_dir))
+        lay = self.layout()
+        # Insert above last btn row
+        lay.insertWidget(lay.count() - 1, open_btn)
+
+        self.create_btn.setEnabled(True)
 
 
 # ─────────────────────────────────────────────
